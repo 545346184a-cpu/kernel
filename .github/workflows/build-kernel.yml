@@ -1,0 +1,111 @@
+name: Build MIX 4 SukiSU + SUSFS + KPI Kernel
+
+on:
+  workflow_dispatch: # 允许你随时手动点击运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential bc curl git python3 flex bison libssl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi libelf-dev wget zip unzip
+        
+    - name: Download Proton Clang Toolchain
+      run: |
+        mkdir -p clang
+        # 下载成熟的 Proton-Clang 编译链，对 5.4 内核兼容性极佳
+        wget -qO clang.tar.gz https://github.com/kdrag0n/proton-clang/archive/master.tar.gz
+        tar -xzf clang.tar.gz -C clang --strip-components=1
+        
+    - name: Clone Kernel Source (Xiaomi MIX 4 - odin)
+      run: |
+        # 帮你找好的 MIX 4 第三方维护源码树，基于 5.4 内核
+        git clone --depth=1 https://github.com/Inkypen79/kernel_xiaomi_odin.git kernel_workspace
+        
+    - name: Integrate Kernel Base (For SukiSU)
+      working-directory: kernel_workspace
+      run: |
+        # 注入底层 KernelSU 核心代码 (SukiSU 管理器向下兼容此内核结构)
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
+    - name: Integrate SUSFS
+      working-directory: kernel_workspace
+      run: |
+        # 拉取 SUSFS (针对 5.4 GKI 内核分支)
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.4
+        
+        # 将 SUSFS 的源码文件覆盖进内核树
+        cp -r susfs4ksu/kernel_patches/fs/* fs/
+        cp -r susfs4ksu/kernel_patches/include/linux/* include/linux/
+        
+        # 自动打补丁，允许部分失败以防源码本身已被修改 (|| true)
+        patch -p1 < susfs4ksu/kernel_patches/50_recipe_for_5.4.patch || true
+
+    - name: Smart Enable KPI & Configs
+      working-directory: kernel_workspace
+      run: |
+        # 自动寻找 MIX 4 的配置文件 (优先找 lahaina-qgki，其次找含 odin 的)
+        DEFCONFIG="arch/arm64/configs/vendor/lahaina-qgki_defconfig"
+        if [ ! -f "$DEFCONFIG" ]; then
+          DEFCONFIG=$(find arch/arm64/configs -name "*odin*defconfig" | head -n 1)
+        fi
+        if [ ! -f "$DEFCONFIG" ]; then
+           DEFCONFIG=$(find arch/arm64/configs -name "*lahaina*defconfig" | head -n 1)
+        fi
+        
+        echo "=> 找到配置文件: $DEFCONFIG"
+        
+        # 强制注入 KPI (Kprobes) 和 SUSFS 相关配置
+        echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_HAVE_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> $DEFCONFIG
+        
+        # 提取文件名供下一步 make 使用
+        echo "DEFCONFIG_FILE=$(basename $DEFCONFIG)" >> $GITHUB_ENV
+
+    - name: Build Kernel
+      working-directory: kernel_workspace
+      run: |
+        export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+        export ARCH=arm64
+        export SUBARCH=arm64
+        # 使用 Google 推荐的交叉编译前缀
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+        export CC=clang
+        
+        # 生成 .config 文件
+        make O=out ${{ env.DEFCONFIG_FILE }}
+        
+        # 执行火力全开多核编译
+        make -j$(nproc) O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+                      
+    - name: Package with AnyKernel3
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git -b master AK3
+        # 自动寻找编译出的 Image 或 Image.gz 并放入打包目录
+        find kernel_workspace/out/arch/arm64/boot/ -name "Image*" -exec cp {} AK3/ \;
+        cd AK3
+        
+        # 将刷机包的机型验证修改为 MIX 4 (odin)
+        sed -i 's/device.name1=maguro/device.name1=odin/g' anykernel.sh
+        sed -i 's/device.name2=toro//g' anykernel.sh
+        sed -i 's/device.name3=toroplus//g' anykernel.sh
+        sed -i 's/device.name4=grouper//g' anykernel.sh
+        
+        # 压缩成最终的卡刷包
+        zip -r9 ../SukiSU-Odin-SUSFS-KPI.zip *
+        
+    - name: Upload Finished Kernel
+      uses: actions/upload-artifact@v3
+      with:
+        name: Flashable-Kernel-Odin
+        path: SukiSU-Odin-SUSFS-KPI.zip
