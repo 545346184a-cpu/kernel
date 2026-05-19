@@ -105,7 +105,7 @@ jobs:
         zip -r9 ../SukiSU-Odin-SUSFS-KPI.zip *
         
     - name: Upload Finished Kernel
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Flashable-Kernel-Odin
         path: SukiSU-Odin-SUSFS-KPI.zip
